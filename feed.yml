@@ -1,0 +1,97 @@
+name: OpenAI Ads feed – Meesterslijpers
+
+on:
+  schedule:
+    # Bronfeed wordt rond 01:25 UTC ververst; daarna dagelijks converteren.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      max_drop_pct:
+        description: "Maximale daling in % t.o.v. vorige run (100 = rem uit, alleen na controle)"
+        required: false
+        default: "20"
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: openai-feed-meesterslijpers
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # GitHub zet geplande taken in openbare repo's uit na 60 dagen zonder activiteit.
+      # Is de laatste wijziging 45+ dagen oud, dan maakt deze stap een lege "commit".
+      - name: Repository actief houden
+        run: |
+          last=$(git log -1 --format=%ct)
+          days=$(( ( $(date +%s) - last ) / 86400 ))
+          if [ "$days" -ge 45 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "Keepalive: automatische taak actief houden"
+            git push
+          else
+            echo "Laatste activiteit $days dagen geleden, keepalive niet nodig."
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Productenlijst van de vorige run ophalen (voor uitverkochte producten en de daalrem).
+      - name: Vorige staat ophalen
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: feed-state-${{ github.run_id }}
+          restore-keys: feed-state-
+
+      - name: XML omzetten naar OpenAI-formaat
+        env:
+          MAX_DROP_PCT: ${{ github.event.inputs.max_drop_pct || '20' }}
+        run: python convert.py
+
+      - name: Nieuwe staat bewaren
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: feed-state-${{ github.run_id }}
+
+      - name: Upload naar OpenAI SFTP (alleen als secrets zijn ingesteld)
+        env:
+          OPENAI_SFTP_HOST: ${{ secrets.OPENAI_SFTP_HOST }}
+          OPENAI_SFTP_PORT: ${{ secrets.OPENAI_SFTP_PORT }}
+          OPENAI_SFTP_USER: ${{ secrets.OPENAI_SFTP_USER }}
+          OPENAI_SFTP_PASSWORD: ${{ secrets.OPENAI_SFTP_PASSWORD }}
+        run: |
+          if [ -n "$OPENAI_SFTP_HOST" ]; then
+            pip install --quiet paramiko
+            python sftp_upload.py
+          else
+            echo "Geen SFTP-secrets, alleen publicatie via GitHub Pages."
+          fi
+
+      - name: Controlerapport in samenvatting
+        if: always()
+        run: cat dist/report.txt >> "$GITHUB_STEP_SUMMARY" || true
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
