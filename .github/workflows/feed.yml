@@ -1,18 +1,23 @@
-name: OpenAI Ads feed – Den Hertog
+name: OpenAI Ads feed – Meesterslijpers
 
 on:
   schedule:
-    # Bronfeed wordt rond 04:55 UTC ververst; daarna dagelijks converteren.
-    - cron: "37 5 * * *"
+    # Bronfeed wordt rond 01:25 UTC ververst; daarna dagelijks converteren.
+    - cron: "17 3 * * *"
   workflow_dispatch:
+    inputs:
+      max_drop_pct:
+        description: "Maximale daling in % t.o.v. vorige run (100 = rem uit, alleen na controle)"
+        required: false
+        default: "20"
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
 concurrency:
-  group: openai-feed
+  group: openai-feed-meesterslijpers
   cancel-in-progress: true
 
 jobs:
@@ -21,12 +26,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # GitHub zet geplande taken in openbare repo's uit na 60 dagen zonder activiteit.
+      # Is de laatste wijziging 45+ dagen oud, dan maakt deze stap een lege "commit".
+      - name: Repository actief houden
+        run: |
+          last=$(git log -1 --format=%ct)
+          days=$(( ( $(date +%s) - last ) / 86400 ))
+          if [ "$days" -ge 45 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "Keepalive: automatische taak actief houden"
+            git push
+          else
+            echo "Laatste activiteit $days dagen geleden, keepalive niet nodig."
+          fi
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
+      # Productenlijst van de vorige run ophalen (voor uitverkochte producten en de daalrem).
+      - name: Vorige staat ophalen
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: feed-state-${{ github.run_id }}
+          restore-keys: feed-state-
+
       - name: XML omzetten naar OpenAI-formaat
+        env:
+          MAX_DROP_PCT: ${{ github.event.inputs.max_drop_pct || '20' }}
         run: python convert.py
+
+      - name: Nieuwe staat bewaren
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: feed-state-${{ github.run_id }}
 
       - name: Upload naar OpenAI SFTP (alleen als secrets zijn ingesteld)
         env:
@@ -43,7 +79,8 @@ jobs:
           fi
 
       - name: Controlerapport in samenvatting
-        run: cat dist/report.txt >> "$GITHUB_STEP_SUMMARY"
+        if: always()
+        run: cat dist/report.txt >> "$GITHUB_STEP_SUMMARY" || true
 
       - uses: actions/upload-pages-artifact@v3
         with:
